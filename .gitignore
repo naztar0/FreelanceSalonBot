@@ -1,0 +1,9 @@
+.env
+.idea/
+__pycache__/
+venv/
+temp/
+test/
+nohup.out
+old/
+payment server/
