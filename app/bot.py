@@ -20,8 +20,7 @@ class NewOrder(StatesGroup):
     date = State()
     time = State()
     price = State()
-    form_text = State()
-    media = State()
+    form_text_media = State()
 
 
 class Portfolio(StatesGroup):
@@ -43,16 +42,15 @@ async def _back(message, state, key):
         return True
 
 
-async def media_handler(message, state, callback):
+async def media_handler(message, state):
     data = await state.get_data()
-    if message.text == misc.next_button:
-        await callback(message, state)
-    elif message.photo:
-        data['photo'].append(message.photo[-1].file_id)
-        await state.update_data({'photo': data['photo']})
+    media = MediaGroup(data)
+    if message.photo:
+        media.add(photo=message.photo[-1].file_id)
+        await state.update_data(media.to_dict)
     elif message.video:
-        data['video'].append(message.video.file_id)
-        await state.update_data({'video': data['video']})
+        media.add(video=message.video.file_id)
+        await state.update_data(media.to_dict)
     else:
         if message.document:
             await message.reply("Отправьте медиа как фото или видео, а не как файл")
@@ -61,7 +59,9 @@ async def media_handler(message, state, callback):
 
 
 async def start_menu(message):
-    await message.answer("Выберите как вы будете пользоваться ботом", reply_markup=ButtonSet(ButtonSet.START))
+    await message.answer("Выберете кто вы 😇\n👉 Клиент - желаете найти и записаться на бьюти услугу\n"
+                         "👉 Мастер - желаете найти клиентов для ваших прекрасных работ😃.",
+                         reply_markup=ButtonSet(ButtonSet.START, row_width=2))
 
 
 async def create_master(message):
@@ -74,7 +74,11 @@ async def create_master(message):
         if not exists:
             cursor.execute(insertQuery, [message.chat.id])
             conn.commit()
-    await message.answer(f"Приветствие для мастеров, бла бла бла", parse_mode='Markdown', reply_markup=ButtonSet(ButtonSet.MASTER, row_width=2))
+    await message.answer(f"QSalon поможет вам найти новых клиентов.\n👉заполните внимательно свой профиль\n"
+                         f"👉выберете категории которые вам подходят и заявки от клиентов будут приходить к вам автоматически!\n\n"
+                         f"Как это работает?\nВы заполняете свое портфолио и вам приходят запросы от клиентов в соответствии с вашим профилем.\n\n"
+                         f"Есть вопросы? администратор @rivikate",
+                         parse_mode='Markdown', reply_markup=ButtonSet(ButtonSet.MASTER_1, row_width=2))
 
 
 async def create_order(message):
@@ -84,31 +88,40 @@ async def create_order(message):
 
 
 async def perform_order(message, order_id):
-    selectQuery = "SELECT client_id FROM orders WHERE ID=(%s)"
+    selectQuery = "SELECT client_id, master_id FROM orders WHERE ID=(%s)"
     selectPortfolioQuery = "SELECT portfolio, ST_X(location), ST_Y(location) FROM masters WHERE user_id=(%s)"
+    updateMessageQuery = "UPDATE orders SET message_id=(%s) WHERE ID=(%s)"
     with DatabaseConnection() as db:
         conn, cursor = db
         cursor.execute(selectQuery, [order_id])
-        client_id = cursor.fetchone()[0]
-        cursor.execute(selectPortfolioQuery, [message.chat.id])
-        portfolio, *location = cursor.fetchone()
-    if not portfolio:
-        portfolio = "отсутствует"
-    address = get_location(location[0], location[1], 'ru') or "недоступно"
-    await bot.send_message(client_id, "Мастер [{0}](tg://user?id={1}) готов взяться за ваш заказ!\n*Адрес:* {2}\n[Портфолио]({3}/{4})"
-                           .format(esc_md(message.chat.full_name), message.chat.id, esc_md(address), misc.portfolio_chat, esc_md(portfolio)),
-                           reply_markup=ButtonSet(ButtonSet.INL_CLIENT_ACCEPT_ORDER, {'order_id': order_id, 'master_id': message.chat.id}), parse_mode='Markdown')
+        client_id, master_id = cursor.fetchone()
+        if not master_id:
+            cursor.execute(selectPortfolioQuery, [message.chat.id])
+            portfolio, *location = cursor.fetchone()
+            cursor.executemany(updateMessageQuery, [(message.message_id, order_id)])
+            conn.commit()
     await message.edit_reply_markup()
+    if master_id:
+        await message.reply("Мастер на этот заказ уже нашелся")
+        return
+    portfolio = portfolio or "отсутствует"
+    username = '@' + esc_md(message.chat.username) if message.chat.username else ''
+    address = get_location(location[0], location[1], 'ru') or "недоступно"
+    geolocation = f"https://google.com/maps/place/{location[0]},{location[1]}"
+    await bot.send_message(client_id, "Мастер [{0}](tg://user?id={1}) {2} готов взяться за ваш заказ!\n*Адрес:* [{3}]({4})\n[Портфолио]({5}/{6})"
+                           .format(esc_md(message.chat.full_name), message.chat.id, username, esc_md(address), geolocation, misc.portfolio_chat, esc_md(portfolio)),
+                           reply_markup=ButtonSet(ButtonSet.INL_CLIENT_ACCEPT_ORDER, {'order_id': order_id, 'master_id': message.chat.id}), parse_mode='Markdown')
     await message.reply("Вы отослали свою кандидатуру клиенту по этому заказу.\nЕсли клиент выберет вас, то скоро с вами свяжется.")
 
 
-async def accept_order(message, order_id, master_id, client_id):
+async def accept_order(message, order_id, master_id, client):
     updateQuery = "UPDATE orders SET master_id=(%s) WHERE ID=(%s)"
     with DatabaseConnection() as db:
         conn, cursor = db
         cursor.executemany(updateQuery, [(master_id, order_id)])
         conn.commit()
-    await bot.send_message(master_id, f"[Клиент](tg://user?id={client_id}) выбрал Вас своим мастером! Можете с ним связаться.", parse_mode='Markdown')
+    username = '@' + esc_md(client.username) if client.username else ''
+    await bot.send_message(master_id, f"[Клиент](tg://user?id={client.id}) {username} выбрал Вас своим мастером! Можете с ним связаться.", parse_mode='Markdown')
     await message.edit_reply_markup()
     await message.answer(f"Вы выбрали [мастера](tg://user?id={master_id})! Можете с ним связаться.", parse_mode='Markdown')
 
@@ -124,7 +137,8 @@ async def save_order(message, state):
         conn.commit()
         cursor.execute(getLastId)
         form_id = cursor.fetchone()[0]
-    await message.answer(f"Пост опубликован\nКогда мастер заинтересуется Вашим заказом, Вы будете уведомлены.",
+    await message.answer(f"Ура🥳 заявка создана!\nТеперь подходящие мастера и салоны оповещены, в ближайшее время вам поступят "
+                         f"предложения от них сюда в бот QSalon ✌\nХороших процедур и настроения☺",
                          parse_mode='Markdown', reply_markup=ButtonSet(ButtonSet.CLIENT))
     await bulk_mailing(data, form_id)
 
@@ -140,42 +154,38 @@ async def master_location(message):
     else:
         await bot.send_location(message.chat.id, result[0], result[1])
     await NewLocation.change.set()
-    await message.answer("Вы можете изменить местоположение.\n"
-                         "Отправьте местоположение, в радиусе которого вы хотели бы получать заказы.\n"
-                         "Либо отправьте текущее местоположение, нажав на кнопку ниже", reply_markup=ButtonSet(ButtonSet.SEND_LOCATION))
+    await message.answer("Укажите адрес вашего салона:\n👉 ТЕКУЩЕЕ МЕСТО , тогда нажмите кнопку ниже «отправить мою локацию»\n"
+                         "👉 ДРУГОЕ  МЕСТО, тогда нажмите «скрепочка» – Location – выберете на карте локацию и нажмите Send location»",
+                         reply_markup=ButtonSet(ButtonSet.SEND_LOCATION))
 
 
 async def master_categories(message, start=False):
-    selectQuery = "SELECT categories FROM masters WHERE user_id=(%s)"
-    with DatabaseConnection() as db:
-        conn, cursor = db
-        cursor.execute(selectQuery, [message.chat.id])
-        result = cursor.fetchone()[0] or '[]'
-    result = json.loads(result)
-    _, count = count_categories(result)
+    master = Master(message.chat.id)
+    list_cats = count_list_categories(master.categories)[1]
+    if master.is_active_sub:
+        button_set = ButtonSet.INL_MASTER_CATEGORIES_SQUEEZE
+    else:
+        button_set = ButtonSet.INL_MASTER_CATEGORIES
     if not start:
-        await message.edit_reply_markup(ButtonSet(ButtonSet.INL_MASTER_CATEGORIES, count))
+        await message.edit_reply_markup(ButtonSet(button_set, list_cats))
         return
     await Subscriptions.change.set()
     await message.answer("Выбор подписок", reply_markup=ButtonSet(ButtonSet.SAVE_CHANGES))
-    await message.answer("Выберите категории и подкатегории, на которые хотите подписаться",
-                         reply_markup=ButtonSet(ButtonSet.INL_MASTER_CATEGORIES, count))
+    await message.answer("У вас первый месяц подписки бесплатно 🤗😀\nНаши символические цены в месяц:\n"
+                         "👉 1 категория - 190 грн\n👉 2 категории - 380 грн\n👉 3 категории и больше - 460 грн\n\n"
+                         "Выберете категории и подкатегории которые вам подходят👌",
+                         reply_markup=ButtonSet(button_set, list_cats))
 
 
 async def master_subcategories(message, cat_num):
-    selectQuery = "SELECT categories FROM masters WHERE user_id=(%s)"
-    with DatabaseConnection() as db:
-        conn, cursor = db
-        cursor.execute(selectQuery, [message.chat.id])
-        result = cursor.fetchone()[0] or '[]'
-    result = json.loads(result)
+    master = Master(message.chat.id)
     key = types.InlineKeyboardMarkup()
     start_shift = 0
     for subs in misc.subcategories[:cat_num]:
         start_shift += len(subs)
     for i, sub in enumerate(misc.subcategories[cat_num]):
         sym, add = "❌ ", True
-        if str(i + start_shift) in result:
+        if str(i + start_shift) in master.categories:
             sym, add = "✅ ", False
         key.add(types.InlineKeyboardButton(sym + sub, callback_data=set_callback(
             CallbackFuncs.CHANGE_CATEGORY, {'sub_num': i + start_shift, 'cat_num': cat_num, 'add': add})))
@@ -193,57 +203,66 @@ async def get_master_subs(message):
     count, balance, pay_date = result
     key = None
     active_until = 'неактивна'
-    can_pay = "Чтобы продлить подписку нажмите на кнопку ниже"
+    can_pay = "👉 Чтобы ПРОДЛИТЬ ПОДПИСКУ нажмите кнопку снизу «продлить» 😉"
+    price = get_subs_price(count)
     if pay_date:
         active_until = datetime.strftime(pay_date, '%d.%m.%Y')
     if count == 0:
         can_pay = "Подпишитесь хотя-бы на одну категорию, чтобы получать заказы"
-    elif balance < count * misc.tariff:
-        can_pay = "У вас недостаточно средств на баллансе чтобы продлить подписку"
+    elif balance < price and pay_date:
+        can_pay = "У вас недостаточно средств на баллансе чтобы продлить подписку на следующий месяц 😚"
     else:
         key = ButtonSet(ButtonSet.RENEW_SUBSCRIPTION)
         await Subs_pay.pay.set()
-    await message.answer(f"*Ваш балланс:* {balance} грн.\n*Стоимость подписки:* {count * misc.tariff} грн.\n"
-                         f"*Подписка активна до:* {active_until}\n\n*{can_pay}*", parse_mode='Markdown', reply_markup=key)
+    await message.answer(f"*Ваш балланс:* {balance} грн.\n*Стоимость подписки:* {price} грн.\n"
+                         f"*Подписка активна до:* {active_until}\n\n*{can_pay}*\n\n"
+                         f"Есть вопросы? администратор @rivikate", parse_mode='Markdown', reply_markup=key)
 
 
 async def save_portfolio(message, state):
     data = await state.get_data()
     await state.finish()
-    message_id = medias_len = 0
-    if data['photo'] and data['video']:
-        medias_len = -1  # just not 1
-    elif data['photo']:
-        medias_len = len(data['photo'])
-    elif data['video']:
-        medias_len = len(data['video'])
-
-    if medias_len:
-        if medias_len == 1:
-            if data['photo']:
-                message_id = (await bot.send_photo(misc.portfolio_chat_id, data['photo'][0], caption=data['form_text'])).message_id
-            elif data['video']:
-                message_id = (await bot.send_video(misc.portfolio_chat_id, data['video'][0], caption=data['form_text'])).message_id
-        else:
-            medias_wrapped = []
-            if data['photo']:
-                medias_wrapped += [types.InputMediaPhoto(data['photo'][0], caption=data['form_text'])] \
-                               + [types.InputMediaPhoto(x) for x in data['photo'][1:]]
-            if data['video']:
-                if not data['photo']:
-                    medias_wrapped += [types.InputMediaVideo(data['video'][0], caption=data['form_text'])]
-                medias_wrapped += [types.InputMediaVideo(x) for x in data['video'][1:]]
-            message_id = (await bot.send_media_group(misc.portfolio_chat_id, medias_wrapped))[0].message_id
-    else:
-        message_id = (await bot.send_message(misc.portfolio_chat_id, data['form_text'])).message_id
-
-    updateQuery = "UPDATE masters SET portfolio=(%s) WHERE user_id=(%s)"
+    col = 'portfolio' if data['p_or_s'] == 1 else 'salon'
+    selectQuery = f"SELECT {col} FROM masters WHERE user_id=(%s)"
+    selectDataQuery = "SELECT data FROM portfolios WHERE id=(%s)"
+    last_data = None
+    media = MediaGroup(data)
     with DatabaseConnection() as db:
         conn, cursor = db
-        cursor.executemany(updateQuery, [(message_id, message.chat.id)])
+        cursor.execute(selectQuery, [message.chat.id])
+        last_id = cursor.fetchone()
+        if last_id: last_id = last_id[0]
+        if data.get('only_text') or data.get('only_media'):
+            cursor.execute(selectDataQuery, [last_id])
+            last_data = json.loads(cursor.fetchone()[0])
+    if data.get('only_text'):
+        media.add(photo=last_data['photo'], video=last_data['video'])
+    elif data.get('only_media'):
+        media.add(text=last_data['text'])
+    media_post = None
+
+    if media.photo or media.video:
+        if not media.is_media_group:
+            if media.photo:
+                media_post = await bot.send_photo(misc.portfolio_chat_id, media.photo[0], caption=media.text)
+            elif media.video:
+                media_post = await bot.send_video(misc.portfolio_chat_id, media.video[0], caption=media.text)
+        else:
+            media_post = await send_media_group(bot, misc.portfolio_chat_id, media)
+    elif media.text:
+        media_post = await bot.send_message(misc.portfolio_chat_id, media.text)
+
+    insertQuery = "INSERT INTO portfolios (id, data) VALUES (%s, %s)"
+    updateQuery = f"UPDATE masters SET {col}=(%s) WHERE user_id=(%s)"
+    deleteQuery = "DELETE FROM portfolios WHERE id=(%s)"
+    with DatabaseConnection() as db:
+        conn, cursor = db
+        cursor.executemany(insertQuery, [(media_post.message_id, json.dumps(data, separators=(',', ':')))])
+        cursor.executemany(updateQuery, [(media_post.message_id, message.chat.id)])
+        cursor.execute(deleteQuery, [last_id])
         conn.commit()
     await state.finish()
-    await message.answer("Портфолио сохранено", reply_markup=ButtonSet(ButtonSet.MASTER))
+    await message.answer("Сохранено", reply_markup=ButtonSet(ButtonSet.MASTER_2))
 
 
 async def top_up_balance(message):
@@ -256,8 +275,14 @@ async def handle_text(message: types.Message):
     await start_menu(message)
 
 
-@dp.message_handler(content_types=['text'])
+@dp.message_handler(content_types=['photo', 'video'])
 async def handle_text(message: types.Message):
+    if message.forward_from_message_id:
+        await handle_forwarded_posts(message)
+
+
+@dp.message_handler(content_types=['text'])
+async def handle_text(message: types.Message, state: FSMContext):
     if message.text == misc.back_button:
         await start_menu(message)
     elif message.text == misc.role_buttons[0]:
@@ -268,18 +293,28 @@ async def handle_text(message: types.Message):
         await create_order(message)
     elif message.text == misc.client_buttons[1]:
         await client_orders(message)
-    elif message.text == misc.master_buttons[0]:
+    elif message.text == misc.master_buttons_1[0]:
         await master_orders(message)
-    elif message.text == misc.master_buttons[1]:
-        await master_categories(message, True)
-    elif message.text == misc.master_buttons[2]:
-        await master_portfolio(message)
-    elif message.text == misc.master_buttons[3]:
-        await master_location(message)
-    elif message.text == misc.master_buttons[4]:
+    elif message.text == misc.master_buttons_1[1]:
+        await master_profile(message)
+    elif message.text == misc.master_buttons_1[2]:
         await get_master_subs(message)
-    elif message.text == misc.master_buttons[5]:
+    elif message.text == misc.master_buttons_1[3]:
         await top_up_balance(message)
+    elif message.text == misc.master_buttons_2[0]:
+        await master_categories(message, True)
+    elif message.text == misc.master_buttons_2[1]:
+        await master_portfolio(message, state, 1)
+    elif message.text == misc.master_buttons_2[2]:
+        await master_portfolio(message, state, 2)
+    elif message.text == misc.master_buttons_2[3]:
+        await master_location(message)
+    elif message.text == misc.master_buttons_2[4]:
+        await message.answer("Выберите кнопку", reply_markup=ButtonSet(ButtonSet.MASTER_1))
+    elif message.text[0] == '/' and message.text[1:].isdigit():
+        await handle_orders_operations(message)
+    elif message.forward_from_message_id:
+        await handle_forwarded_posts(message)
 
 
 @dp.message_handler(content_types=['text'], state=NewOrder.category)
@@ -307,9 +342,10 @@ async def client_subcategories(callback_query, state, sub_num):
     await callback_query.message.delete()
     await state.update_data({'category': sub_num})
     await NewOrder.next()
-    await callback_query.message.answer(
-        "Отправьте местоположение, в радиусе которого вы хотели бы получить услугу.\n"
-        "Либо отправьте текущее местоположение, нажав на кнопку ниже", reply_markup=ButtonSet(ButtonSet.SEND_LOCATION))
+    await callback_query.message.answer(f"ВЫБЕРЕТЕ МЕСТО в радиусе {misc.radius} км от которого вы хотите получить услугу😉:\n\n"
+                                        "👉 ТЕКУЩЕЕ МЕСТО , тогда нажмите кнопку ниже «отправить мою локацию»\n"
+                                        "👉 Любое ДРУГОЕ МЕСТО, тогда нажмите «скрепочка» – Location – выберете на карте локацию и нажмите Send location»",
+                                        reply_markup=ButtonSet(ButtonSet.SEND_LOCATION))
 
 
 @dp.message_handler(content_types=['text', 'location'], state=NewOrder.location)
@@ -320,7 +356,8 @@ async def handle_text(message: types.Message, state: FSMContext):
     await state.update_data({'x': x, 'y': y})
     now = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     days = [now + timedelta(x) for x in range(8)]
-    key = types.InlineKeyboardMarkup(row_width=2)
+    key = types.InlineKeyboardMarkup(row_width=1)
+    key.add(types.InlineKeyboardButton('На ближайшее время', callback_data=set_callback(CallbackFuncs.CHOOSE_DAY, 0)))
     for day in days:
         key.insert(types.InlineKeyboardButton(f'{day.day} {misc.month_names[day.month - 1]}',
                                               callback_data=set_callback(CallbackFuncs.CHOOSE_DAY, int(day.timestamp()))))
@@ -335,6 +372,16 @@ async def handle_text(message: types.Message, state: FSMContext):
 
 
 async def client_choose_day(callback_query, state, timestamp):
+    if timestamp == 0:
+        now = datetime.now()
+        if now.minute < 30:
+            nearest = now.replace(minute=30)
+        else:
+            nearest = now.replace(hour=now.hour + 1 if now.hour < 23 else 0, minute=0)
+        await state.update_data({'timestamp': nearest.timestamp()})
+        await NewOrder.next()
+        await client_choose_time(callback_query, state, None, True)
+        return
     await state.update_data({'timestamp': timestamp})
     key = types.InlineKeyboardMarkup(row_width=2)
     for t in misc.times:
@@ -349,15 +396,17 @@ async def handle_text(message: types.Message, state: FSMContext):
     await _back(message, state, ButtonSet.CLIENT)
 
 
-async def client_choose_time(callback_query, state, time):
-    h, m = time.split(':')
-    seconds = int(h) * 3600 + int(m) * 60
-    args = ('❌ ' for _ in range(3))
-    data = await state.get_data()
-    await state.update_data({'time': time, 'timestamp': data['timestamp'] + seconds})
+async def client_choose_time(callback_query, state, time, skip=False):
+    if not skip:
+        h, m = time.split(':')
+        seconds = int(h) * 3600 + int(m) * 60
+        data = await state.get_data()
+        await state.update_data({'timestamp': data['timestamp'] + seconds})
+    args = ('' for _ in range(3))
     await NewOrder.next()
     await callback_query.message.delete()
-    await callback_query.message.answer("Выберите ценовые категории", reply_markup=ButtonSet(ButtonSet.INL_PRICE, args))
+    await callback_query.message.answer("Выберете примерную ценовую политику бьюти услуги (можна два пункта👌). И нажмите «Далее ➡»",
+                                        reply_markup=ButtonSet(ButtonSet.INL_PRICE, args))
 
 
 @dp.message_handler(content_types=['text'], state=NewOrder.price)
@@ -369,8 +418,8 @@ async def client_choose_price(callback_query, state, price):
     data = await state.get_data()
     price_flags = data.get('price') or 0
     price_flags ^= price
-    await state.update_data({'price': price_flags})
-    args = ('✅ ' if price_flags & 2 ** x else '❌ ' for x in range(3))
+    await state.update_data({'price': price_flags, 'photo': [], 'video': []})
+    args = ('✅ ' if price_flags & 2 ** x else '' for x in range(3))
     await callback_query.message.edit_reply_markup(ButtonSet(ButtonSet.INL_PRICE, args))
 
 
@@ -381,28 +430,44 @@ async def client_submit_price(callback_query, state):
         return
     await NewOrder.next()
     await callback_query.message.delete()
-    await callback_query.message.answer("Напишите дополнительную информацио для мастера, либо нажмите «Далее ➡»",
+    await callback_query.message.answer("Можно написать:\n👉 КОММЕНТАРИЙ для мастера/салона\n"
+                                        "👉 Загрузить медиа файлы например желаемый результат 🤩(не больше 3-х файлов),\n"
+                                        "👉 Либо просто ПРОПУСТИТЕ и нажмите «Далее ➡»",
                                         reply_markup=ButtonSet(ButtonSet.NEXT, row_width=2))
 
 
-@dp.message_handler(content_types=['text'], state=NewOrder.form_text)
+@dp.message_handler(content_types=types.ContentTypes.ANY, state=NewOrder.form_text_media)
 async def handle_text(message: types.Message, state: FSMContext):
     if await _back(message, state, ButtonSet.CLIENT):
         return
-    if len(message.text) > 600:
-        await message.answer("Слишком длинный текст, попробуйте снова")
+    if message.text == misc.next_button:
+        await save_order(message, state)
         return
-    await state.update_data({'form_text': message.text if message.text != misc.next_button else '', 'photo': [], 'video': []})
-    await NewOrder.next()
-    await message.answer("👉 Теперь можете загрузить медиа файлы к вашей публикации (не больше 6 фото или 1 видео)\n\n"
-                         "После загрузки всех медиафайлов нажмите «Далее ➡»")
+    if message.text:
+        if len(message.text) > 600:
+            await message.answer("Слишком длинный текст, попробуйте снова")
+            return
+        await state.update_data({'text': message.text})
+    else:
+        await media_handler(message, state)
 
 
-@dp.message_handler(content_types=types.ContentType.ANY, state=NewOrder.media)
-async def message_handler(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.CLIENT):
-        return
-    await media_handler(message, state, save_order)
+async def master_profile(message):
+    selectQuery = "SELECT categories, portfolio, salon, location FROM masters WHERE user_id=(%s)"
+    with DatabaseConnection() as db:
+        conn, cursor = db
+        cursor.execute(selectQuery, [message.from_user.id])
+        result = cursor.fetchone()
+    if all(result):
+        reply = "Выберите кнопку"
+    else:
+        reply = "*Чтобы начать получать заказы, заполните профиль полностью!*\n\nОсталось заполнить:\n" \
+                f"{'— Подписки на категории' if not result[0] else ''}\n" \
+                f"{'— Портфолио' if not result[1] else ''}\n" \
+                f"{'— Салон' if not result[2] else ''}\n" \
+                f"{'— Местоположение' if not result[3] else ''}\n"
+    reply += "\n\nЕсть вопросы? администратор @rivikate"
+    await message.answer(reply, reply_markup=ButtonSet(ButtonSet.MASTER_2), parse_mode='Markdown')
 
 
 def update_subscriptions(user_id, num, add=True):
@@ -422,45 +487,41 @@ def update_subscriptions(user_id, num, add=True):
         conn.commit()
 
 
-async def update_subs_count(callback_query, state):
+async def update_subs_count(message, state):
     await state.finish()
-    await callback_query.message.edit_reply_markup()
     selectQuery = "SELECT categories, categories_count FROM masters WHERE user_id=(%s)"
     updateQuery = "UPDATE masters SET categories_count=(%s) WHERE user_id=(%s)"
     with DatabaseConnection() as db:
         conn, cursor = db
-        cursor.execute(selectQuery, [callback_query.message.chat.id])
+        cursor.execute(selectQuery, [message.from_user.id])
         categories, old_count = cursor.fetchone()
     categories = json.loads(categories) if categories else []
-    new_count = count_categories(categories)[0]
+    new_count = count_list_categories(categories)[0]
     answer = ''
-    if old_count == new_count:
+    if old_count == new_count or (old_count >= len(misc.tariffs) and new_count >= len(misc.tariffs)):
         answer = "Изменения сохранены"
     else:
         with DatabaseConnection() as db:
             conn, cursor = db
-            cursor.executemany(updateQuery, [(new_count, callback_query.message.chat.id)])
+            cursor.executemany(updateQuery, [(new_count, message.from_user.id)])
             conn.commit()
         diff = abs(old_count - new_count)
         if old_count > new_count:
-            answer = f"Вы отписались от категорий: {diff}\nСтоимость подписки уменьшилась на " \
-                     f"{diff * misc.tariff} грн. и теперь составляет {new_count * misc.tariff} грн."
+            answer = f"Вы отписались от категорий: {diff}\n"
         elif old_count < new_count:
-            answer = f"Вы подписались на категории: {diff}\nСтоимость подписки увеличилась на " \
-                     f"{diff * misc.tariff} грн. и теперь составляет {new_count * misc.tariff} грн."
-    await callback_query.message.answer(answer, reply_markup=ButtonSet(ButtonSet.MASTER))
+            answer = f"Вы подписались на категории: {diff}\n"
+        answer += f"Стоимость подписки теперь составляет {get_subs_price(new_count)} грн."
+    await message.answer(answer, reply_markup=ButtonSet(ButtonSet.MASTER_2))
 
 
 async def client_orders(message):
     orders = Orders(message.from_user.id, Orders.CLIENT)
     reply = ''
-    for i, order in enumerate(orders.orders, start=1):
+    for order in orders.orders:
         master = f"[мастер](tg://user?id={order.master_id})" if order.master_id else "_мастер пока не найден_"
-        # address = get_location(order.latitude, order.longitude, 'ru') or "Адрес на карте"
-        reply += f"*{i}.* {order.datetime.strftime('%d.%m %H:%M')} {master}\n" \
+        reply += f"*{order.id}.* {order.datetime.strftime('%d.%m %H:%M')} {master}\n" \
                  f"[Адрес на карте](https://google.com/maps/place/{order.latitude},{order.longitude})\n" \
-                 f"\\[/11{order.id}] ➖ 📝 *изменить*\n" \
-                 f"\\[/12{order.id}] ➖ ❌ *удалить*\n➖➖➖➖\n"
+                 f"\\[/11{order.id}] ➖ ❌ *удалить*\n➖➖➖➖\n"
     if not reply:
         reply = "У вас пока нет заказов"
     reply_parts = parts.safe_split_text(reply, split_separator='➖➖➖➖')
@@ -471,10 +532,10 @@ async def client_orders(message):
 async def master_orders(message):
     orders = Orders(message.from_user.id, Orders.MASTER)
     reply = ''
-    for i, order in enumerate(orders.orders, start=1):
-        reply += f"*{i}.* {order.datetime.strftime('%d.%m %H:%M')} [клиент](tg://user?id={order.client_id})\n" \
-                 f"[Адрес на карте](https://google.com/maps/place/{order.latitude},{order.longitude})\n" \
-                 f"\\[/22{order.id}] ➖ ❌ *удалить*\n➖➖➖➖\n"
+    for order in orders.orders:
+        reply += f"*{order.id}.* {order.datetime.strftime('%d.%m %H:%M')} [клиент](tg://user?id={order.client_id})\n" \
+                 f"\\[/21{order.id}] ➖ ❌ *удалить*\n" \
+                 f"\\[/22{order.id}] ➖ ℹ *подробнее*\n➖➖➖➖\n"
     if not reply:
         reply = "У вас пока нет заказов"
     reply_parts = parts.safe_split_text(reply, split_separator='➖➖➖➖')
@@ -482,57 +543,82 @@ async def master_orders(message):
         await message.answer(part, parse_mode='Markdown', disable_web_page_preview=True)
 
 
-async def master_portfolio(message):
-    selectQuery = "SELECT portfolio FROM masters WHERE user_id=(%s)"
+async def master_portfolio(message, state, p_or_s):
+    col = 'portfolio' if p_or_s == 1 else 'salon'
+    selectQuery = f"SELECT {col} FROM masters WHERE user_id=(%s)"
     with DatabaseConnection() as db:
         conn, cursor = db
         cursor.execute(selectQuery, [message.chat.id])
         portfolio = cursor.fetchone()[0]
     await Portfolio.view.set()
-    answer = f"[Портфолио]({misc.portfolio_chat}/{portfolio})" if portfolio else "Портфолио отсутствует"
-    await message.answer(answer, parse_mode='Markdown', reply_markup=ButtonSet(ButtonSet.EDIT))
+    if p_or_s == 1:
+        answer = f"[Портфолио]({misc.portfolio_chat}/{portfolio})" if portfolio else "Портфолио отсутствует"
+    else:
+        answer = f"[Салон]({misc.portfolio_chat}/{portfolio})" if portfolio else "Информация о салоне отсутствует"
+    await state.update_data({'p_or_s': p_or_s})
+    button_set = ButtonSet.EDIT
+    if portfolio:
+        button_set = ButtonSet.EDIT_PART if p_or_s == 1 else ButtonSet.EDIT_PART_SALON
+    await message.answer(answer, parse_mode='Markdown', reply_markup=ButtonSet(button_set))
 
 
 @dp.message_handler(content_types=['text'], state=Subscriptions.change)
 async def handle_text(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.MASTER):
+    if await _back(message, state, ButtonSet.MASTER_2):
         return
     if message.text == misc.save_changes:
         await state.finish()
-        await message.answer("Сохранено", reply_markup=ButtonSet(ButtonSet.MASTER))
+        await update_subs_count(message, state)
+        update_active_master(message.from_user.id)
 
 
 @dp.message_handler(content_types=['text'], state=Portfolio.view)
 async def handle_text(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.MASTER):
+    if await _back(message, state, ButtonSet.MASTER_2):
+        return
+    if message.text == misc.edit_buttons[2]:
+        await state.update_data({'only_text': True})
+    elif message.text == misc.edit_buttons[3]:
+        await state.update_data({'only_media': True, 'photo': [], 'video': []})
+        await Portfolio.media.set()
+        await message.answer("👉 Загрузите медиа файлы (не больше 10 фото и видео)\n\n"
+                             "После загрузки всех медиафайлов нажмите «Далее ➡»", reply_markup=ButtonSet(ButtonSet.NEXT, row_width=2))
         return
     await Portfolio.next()
-    await message.answer("Отправьте текст портфолио", reply_markup=ButtonSet(ButtonSet.BACK))
+    await message.answer("Отправьте текст для подписи вашего портфолио", reply_markup=ButtonSet(ButtonSet.BACK))
 
 
 @dp.message_handler(content_types=['text'], state=Portfolio.text)
 async def handle_text(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.MASTER):
+    if await _back(message, state, ButtonSet.MASTER_2):
         return
     if len(message.text) > 1000:
         await message.answer("Слишком длинный текст, попробуйте снова")
         return
-    await state.update_data({'form_text': message.text, 'photo': [], 'video': []})
+    data = await state.get_data()
+    await state.update_data({'text': message.text})
+    if data.get('only_text'):
+        await save_portfolio(message, state)
+        return
     await Portfolio.next()
-    await message.answer("👉 Теперь можете загрузить медиа файлы к вашей публикации (не больше 6 фото или 1 видео)\n\n"
+    await message.answer("👉 Загрузите медиа файлы к вашему портфолио (не больше 10 фото и видео)\n\n"
                          "После загрузки всех медиафайлов нажмите «Далее ➡»", reply_markup=ButtonSet(ButtonSet.NEXT, row_width=2))
 
 
 @dp.message_handler(content_types=types.ContentType.ANY, state=Portfolio.media)
 async def message_handler(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.MASTER):
+    if await _back(message, state, ButtonSet.MASTER_2):
         return
-    await media_handler(message, state, save_portfolio)
+    if message.text == misc.next_button:
+        await save_portfolio(message, state)
+        update_active_master(message.from_user.id)
+        return
+    await media_handler(message, state)
 
 
 @dp.message_handler(content_types=['text', 'location'], state=NewLocation.change)
 async def handle_text(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.MASTER) or not message.location:
+    if await _back(message, state, ButtonSet.MASTER_2) or not message.location:
         return
     x, y = message.location.latitude, message.location.longitude
     updateQuery = "UPDATE masters SET location=ST_GeomFromText(%s) WHERE user_id=(%s)"
@@ -541,32 +627,33 @@ async def handle_text(message: types.Message, state: FSMContext):
         cursor.executemany(updateQuery, [(loc_str(x, y), message.chat.id)])
         conn.commit()
     await state.finish()
-    await message.answer("Местоположение сохранено", reply_markup=ButtonSet(ButtonSet.MASTER))
+    await message.answer("Местоположение сохранено", reply_markup=ButtonSet(ButtonSet.MASTER_2))
+    update_active_master(message.from_user.id)
 
 
 @dp.message_handler(content_types=['text'], state=Subs_pay.pay)
 async def handle_text(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.MASTER) or message.text != "Продлить подписку":
+    if await _back(message, state, ButtonSet.MASTER_1) or message.text != "Продлить подписку":
         return
     selectQuery = "SELECT categories_count, balance, pay_date FROM masters WHERE user_id=(%s)"
     updateQuery = "UPDATE masters SET balance=(%s), pay_date=(%s) WHERE user_id=(%s)"
     with DatabaseConnection() as db:
         conn, cursor = db
         cursor.execute(selectQuery, [message.chat.id])
-        result = cursor.fetchone()
-        count, balance, pay_date = result
-        if not pay_date:
+        count, balance, pay_date = cursor.fetchone()
+        new_balance = balance - (get_subs_price(count)) if pay_date else 0
+        if not pay_date or pay_date < datetime.now():
             pay_date = datetime.now()
         active_until = pay_date + timedelta(days=30)
-        cursor.executemany(updateQuery, [(balance - (count * misc.tariff), active_until, message.chat.id)])
+        cursor.executemany(updateQuery, [(new_balance, active_until, message.chat.id)])
         conn.commit()
     await state.finish()
-    await message.answer("Подписка успешно продлена", reply_markup=ButtonSet(ButtonSet.MASTER))
+    await message.answer("Подписка успешно продлена", reply_markup=ButtonSet(ButtonSet.MASTER_1))
 
 
 @dp.message_handler(content_types=['text'], state=Top_up_balance.amount)
 async def handle_text(message: types.Message, state: FSMContext):
-    if await _back(message, state, ButtonSet.MASTER):
+    if await _back(message, state, ButtonSet.MASTER_1):
         return
     if not message.text.isdigit():
         await message.reply("Недействительная сумма!")
@@ -584,8 +671,61 @@ async def handle_text(message: types.Message, state: FSMContext):
         return
     key = types.InlineKeyboardMarkup()
     key.add(types.InlineKeyboardButton("Оплатить", url=pay_link))
-    await message.answer(f"Ваш баланс будет пополнен на {amount} грн.", reply_markup=ButtonSet(ButtonSet.MASTER))
+    await message.answer(f"Ваш баланс будет пополнен на {amount} грн.", reply_markup=ButtonSet(ButtonSet.MASTER_1))
     await message.answer("Чтобы оплатить используйте кнопку ниже.\nПосле оплаты бот автоматически обработает платёж.", reply_markup=key)
+
+
+async def handle_orders_operations(message):
+    # /11{id} - client delete
+    # /21{id} - master delete
+    # /22{id} - more info
+    code = message.text[1:]
+    order_id = int(code[2:])
+    if code[0] == '1':
+        if code[1] == '1':
+            order = Orders(message.from_user.id, Orders.CLIENT).get(order_id)
+            deleteQuery = "DELETE FROM orders WHERE ID=(%s) AND client_id=(%s)"
+            with DatabaseConnection() as db:
+                conn, cursor = db
+                cursor.executemany(deleteQuery, [(order_id, message.from_user.id)])
+                conn.commit()
+            await message.answer(f"Заказ №{order_id} удален")
+            if order.master_id:
+                await send_message(bot.send_message, chat_id=order.master_id, text=f"[Клиент](tg://user?id={order.client_id}) отменил заказ №{order_id}", parse_mode='Markdown')
+    elif code[0] == '2':
+        if code[1] == '1':
+            order = Orders(message.from_user.id, Orders.CLIENT).get(order_id)
+            deleteQuery = "DELETE FROM orders WHERE ID=(%s) AND master_id=(%s)"
+            with DatabaseConnection() as db:
+                conn, cursor = db
+                cursor.executemany(deleteQuery, [(order_id, message.from_user.id)])
+                conn.commit()
+            await message.answer(f"Заказ №{order_id} удален")
+            if order.client_id:
+                await send_message(bot.send_message, chat_id=order.client_id, text=f"[Мастер](tg://user?id={order.master_id}) отменил заказ №{order_id}", parse_mode='Markdown')
+        elif code[1] == '2':
+            selectMessageQuery = "SELECT message_id FROM orders WHERE ID=(%s)"
+            with DatabaseConnection() as db:
+                conn, cursor = db
+                cursor.execute(selectMessageQuery, [order_id])
+                message_id = cursor.fetchone()[0]
+            await bot.send_message(message.chat.id, f"Заказ №{order_id} ⬆", reply_to_message_id=message_id)
+
+
+async def handle_forwarded_posts(message):
+    if message.from_user.id not in misc.admins:
+        return
+    if message.forward_from_chat.id != misc.portfolio_chat_id:
+        return
+    selectQuery = "SELECT user_id FROM masters WHERE portfolio=(%s) OR salon=(%s)"
+    with DatabaseConnection() as db:
+        conn, cursor = db
+        cursor.executemany(selectQuery, [(message.forward_from_message_id, message.forward_from_message_id)])
+        result = cursor.fetchone()
+    if not result:
+        await message.answer("Не найдено мастера с таким портфолио/салоном")
+        return
+    await message.answer(f"Найден [мастер](tg://user?id={result[0]})\nuser\\_id: `{result[0]}`", parse_mode='Markdown')
 
 
 @dp.callback_query_handler(lambda callback_query: True)
@@ -594,7 +734,7 @@ async def callback_inline(callback_query: types.CallbackQuery):
     if data is None: return
     func, data = data
     if func == CallbackFuncs.CLIENT_ACCEPT_ORDER:
-        await accept_order(callback_query.message, data['order_id'], data['master_id'], callback_query.message.chat.id)
+        await accept_order(callback_query.message, data['order_id'], data['master_id'], callback_query.message.chat)
     elif func == CallbackFuncs.MASTER_ACCEPT_ORDER:
         await perform_order(callback_query.message, data)
 

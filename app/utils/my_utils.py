@@ -7,7 +7,7 @@ from contextlib import suppress
 from asyncio import sleep
 from datetime import datetime
 from math import cos, radians
-from aiogram import types, helper
+from aiogram import types, helper, Bot
 from aiogram.types import ReplyKeyboardMarkup as RKM, InlineKeyboardMarkup as IKM
 from aiogram.types import KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton
 from aiogram.utils import exceptions, callback_data
@@ -44,9 +44,12 @@ class ButtonSet(helper.Helper):
     START = helper.Item()
     BACK = helper.Item()
     CLIENT = helper.Item()
-    MASTER = helper.Item()
+    MASTER_1 = helper.Item()
+    MASTER_2 = helper.Item()
     SEND_LOCATION = helper.Item()
     SAVE_CHANGES = helper.Item()
+    EDIT_PART = helper.Item()
+    EDIT_PART_SALON = helper.Item()
     EDIT = helper.Item()
     NEXT = helper.Item()
     RENEW_SUBSCRIPTION = helper.Item()
@@ -55,6 +58,7 @@ class ButtonSet(helper.Helper):
     INL_PRICE = helper.Item()
     INL_CLIENT_CATEGORIES = helper.Item()
     INL_MASTER_CATEGORIES = helper.Item()
+    INL_MASTER_CATEGORIES_SQUEEZE = helper.Item()
 
     def __new__(cls, btn_set: helper.Item = None, args=None, row_width=1):
         if btn_set == cls.REMOVE:
@@ -68,14 +72,21 @@ class ButtonSet(helper.Helper):
         elif btn_set == cls.CLIENT:
             key.add(*(KeyboardButton(x) for x in misc.client_buttons))
             key.add(KeyboardButton(misc.back_button))
-        elif btn_set == cls.MASTER:
+        elif btn_set == cls.MASTER_1:
             key.row_width = 2
-            key.add(*(KeyboardButton(x) for x in misc.master_buttons))
+            key.add(*(KeyboardButton(x) for x in misc.master_buttons_1))
             key.add(KeyboardButton(misc.back_button))
+        elif btn_set == cls.MASTER_2:
+            key.row_width = 2
+            key.add(*(KeyboardButton(x) for x in misc.master_buttons_2))
         elif btn_set == cls.SAVE_CHANGES:
             key.add(*(KeyboardButton(x) for x in (misc.save_changes, misc.back_button)))
+        elif btn_set == cls.EDIT_PART:
+            key.add(*(KeyboardButton(x) for x in (*misc.edit_buttons[1:], misc.back_button)))
+        elif btn_set == cls.EDIT_PART_SALON:
+            key.add(*(KeyboardButton(x) for x in (*misc.edit_buttons_salon[1:], misc.back_button)))
         elif btn_set == cls.EDIT:
-            key.add(*(KeyboardButton(x) for x in ('Изменить', misc.back_button)))
+            key.add(*(KeyboardButton(x) for x in (misc.edit_buttons[0], misc.back_button)))
         elif btn_set == cls.NEXT:
             key.add(*(KeyboardButton(x) for x in (misc.back_button, misc.next_button)))
         elif btn_set == cls.RENEW_SUBSCRIPTION:
@@ -94,6 +105,8 @@ class ButtonSet(helper.Helper):
             ikey.add(*(types.InlineKeyboardButton(cat, callback_data=set_callback(CallbackFuncs.NEW_ORDER_CATEGORIES, x)) for x, cat in enumerate(misc.categories)))
         elif btn_set == cls.INL_MASTER_CATEGORIES:
             ikey.add(*(types.InlineKeyboardButton(f'{sub} ({args[x]})', callback_data=set_callback(CallbackFuncs.MASTER_CATEGORIES, x)) for x, sub in enumerate(misc.categories)))
+        elif btn_set == cls.INL_MASTER_CATEGORIES_SQUEEZE:
+            ikey.add(*(types.InlineKeyboardButton(f'{sub} ({args[x]})', callback_data=set_callback(CallbackFuncs.MASTER_CATEGORIES, x)) for x, sub in enumerate(misc.categories) if args[x]))
         return key or ikey
 
 
@@ -123,6 +136,90 @@ class Orders:
             cursor.execute(selectQuery, [user_id])
             result = cursor.fetchall()
         self.result = result or ()
+
+    def get(self, order_id):
+        for order in self.orders:
+            if order.id == order_id:
+                return order
+
+
+class Master:
+    def __init__(self, user_id):
+        selectQuery = "SELECT ID, user_id, balance, categories, categories_count, pay_date, portfolio, salon, " \
+                      "ST_X(location), ST_Y(location), active FROM masters WHERE user_id=(%s)"
+        with DatabaseConnection() as db:
+            conn, cursor = db
+            cursor.execute(selectQuery, [user_id])
+            result = cursor.fetchone()
+        self.id, self.user_id, self.balance, self.categories, self.categories_count, self.pay_date, self.portfolio, \
+            self.salon, self.loc_x, self.loc_y, self.active = result
+        self.categories = json.loads(self.categories) if self.categories else []
+
+    @property
+    def is_active_sub(self):
+        return self.pay_date >= datetime.now() if self.pay_date else False
+
+
+class MediaGroup:
+    def __init__(self, data=None, prefer_photo=True):
+        """
+        :param data: Dict{'text': String, 'photo': List[str], 'video': List[str]} |
+                     Photo and video are lists of their file_id
+        :param prefer_photo: If the amount of medias is more than the limit, reduce the number of photos or videos
+                             in favor of the photos, otherwise of the videos
+        """
+        if data is None:
+            data = {}
+        self.prefer_photo = prefer_photo
+        self.photo_limit = 10
+        self.video_limit = 10
+        self.text = data.get('text')
+        self.photo = data.get('photo') or []
+        self.video = data.get('video') or []
+
+    def __bool__(self):
+        return any((self.text, self.photo, self.video))
+
+    def add(self, text=None, photo=None, video=None):
+        if text: self.text = text
+        if photo: self.photo.append(photo)
+        if video: self.video.append(video)
+
+    @property
+    def is_media_group(self):
+        return len(self.photo) + len(self.video) > 1
+
+    @property
+    def to_dict(self):
+        if self.prefer_photo:
+            self.video_limit = self.photo_limit - len(self.photo)
+        else:
+            self.photo_limit = self.video_limit - len(self.video)
+        return {'text': self.text, 'photo': self.photo[:self.photo_limit], 'video': self.video[:self.video_limit]}
+
+    @property
+    def to_json(self):
+        return json.dumps(self.to_dict, separators=(',', ':'))
+
+
+async def send_media_group(bot: Bot, chat_id: int, media: MediaGroup):
+    if not media.is_media_group:
+        if media.photo:
+            return await bot.send_photo(chat_id, media.photo[0], caption=media.text)
+        elif media.video:
+            return await bot.send_video(chat_id, media.video[0], caption=media.text)
+    else:
+        medias_wrapped = []
+        if media.photo:
+            medias_wrapped += [types.InputMediaPhoto(media.photo[0], caption=media.text)] \
+                            + [types.InputMediaPhoto(x) for x in media.photo[1:]]
+        if media.video:
+            shift = 0
+            if not media.photo:
+                medias_wrapped += [types.InputMediaVideo(media.video[0], caption=media.text)]
+                shift = 1
+            medias_wrapped += [types.InputMediaVideo(x) for x in media.video[shift:]]
+        return (await bot.send_media_group(chat_id, medias_wrapped))[0]
 
 
 async def delete_message(func, **kwargs):
@@ -194,7 +291,7 @@ def get_subcategory_name(index: int) -> str:
             return misc.categories[cat] + ': ' + sub[index - i]
 
 
-def count_categories(subs: list) -> tuple:
+def count_list_categories(subs: list) -> tuple:
     res_list = []
     res_count = i = 0
     subs = [int(x) for x in subs]
@@ -271,9 +368,29 @@ def way_for_pay_request_purchase(user_id, amount):
         return False, response['reason']
 
 
+def update_active_master(master_id, check_payment=False):
+    selectQuery = "SELECT categories, portfolio, salon, location FROM masters WHERE user_id=(%s)"
+    updateQuery = "UPDATE masters SET active=(%s) WHERE user_id=(%s)"
+    with DatabaseConnection() as db:
+        conn, cursor = db
+        if check_payment:
+            pass
+        else:
+            cursor.execute(selectQuery, [master_id])
+            result = cursor.fetchone()
+            if all(result):
+                cursor.executemany(updateQuery, [(True, master_id)])
+        conn.commit()
+
+
+def get_subs_price(num):
+    if num <= len(misc.tariffs):
+        return misc.tariffs[num - 1]
+    return misc.tariffs[-1]
+
+
 async def bulk_mailing(data, form_id):
     optimized = True  # max measurement error ~1.4 (sqrt of 2)
-    r = 5  # km
     selectQuery1 = "SELECT user_id FROM (" \
                    "    SELECT " \
                    "    user_id, " \
@@ -285,13 +402,14 @@ async def bulk_mailing(data, form_id):
                    "    @a:=SIN(@d1/2)*SIN(@d1/2)+COS(@f1)*COS(@f2)*SIN(@d2/2)*SIN(@d2/2), " \
                    "    @dist:=6371000*2*ATAN2(SQRT(@a), SQRT(1-@a)) " \
                    "    FROM masters) QA " \
-                   "WHERE @dist <= %s AND categories LIKE (%s)"
+                   "WHERE @dist <= %s AND categories LIKE (%s) AND active=1 AND pay_date >= NOW()"
     selectQuery2 = "SELECT user_id FROM masters WHERE " \
                    "ST_X(location) <= %s AND " \
                    "ST_X(location) >= %s AND " \
                    "ST_Y(location) <= %s AND " \
                    "ST_Y(location) >= %s AND " \
-                   "categories LIKE (%s)"
+                   "categories LIKE (%s) AND active=1 AND pay_date >= NOW()"
+    r = misc.radius
     cat_filter = f'%"{data["category"]}"%'
     x, y = data['x'], data['y']
     latitude_dist = 111.3
@@ -311,7 +429,6 @@ async def bulk_mailing(data, form_id):
         else:
             cursor.executemany(selectQuery1, [(x, y, r, cat_filter)])
         result = cursor.fetchall()
-    media_post = None
     price = ''
     price_flags = data['price']
     for i in range(3):
@@ -319,19 +436,13 @@ async def bulk_mailing(data, form_id):
             if price: price += ', '
             price += '$' * (i + 1)
     category = get_subcategory_name(data['category'])
-    form_text = esc_md(data['form_text'])
+    form_text = esc_md(data.get('text') or '-')
     dt = datetime.fromtimestamp(data['timestamp'])
     text = f"*Новый заказ!*\n*Категория:* {category}\n*Дата*: {dt.day} {misc.month_names[dt.month - 1]}\n" \
-           f"*Время:* {data['time']}\n*Ценовая категория:* {price}\n*Комментарий:* {form_text}"
-    if data['photo']:
-        if len(data['photo']) == 1:
-            media_post = await misc.bot.send_photo(misc.media_chat_id, data['photo'][0])
-        else:
-            photos = [types.InputMediaPhoto(x) for x in data['photo']]
-            media_post = await misc.bot.send_media_group(misc.media_chat_id, photos)
-            media_post = media_post[0]
-    elif data['video']:
-        media_post = await misc.bot.send_video(misc.media_chat_id, data['video'], caption=data['form_text'])
+           f"*Время:* {dt.strftime('%H:%M')}\n*Ценовая категория:* {price}\n*Комментарий:* {form_text}"
+    media = MediaGroup(data)
+    media.text = None
+    media_post = await send_media_group(misc.bot, misc.media_chat_id, media)
     if media_post:
         text = f'[­]({misc.media_chat}/{media_post.message_id})' + text
     for res in result:
@@ -339,5 +450,6 @@ async def bulk_mailing(data, form_id):
         await sleep(.05)
 
 
-__all__ = ('ButtonSet', 'CallbackFuncs', 'delete_message', 'send_message', 'esc_md', 'set_callback', 'get_callback',
-           'get_location', 'way_for_pay_request_purchase', 'loc_str', 'bulk_mailing', 'count_categories', 'Orders')
+__all__ = ('ButtonSet', 'CallbackFuncs', 'delete_message', 'send_message', 'esc_md', 'set_callback', 'get_callback', 'update_active_master', 'Master',
+           'get_location', 'way_for_pay_request_purchase', 'loc_str', 'bulk_mailing', 'count_list_categories', 'Orders', 'get_subcategory_name', 'get_subs_price',
+           'MediaGroup', 'send_media_group')

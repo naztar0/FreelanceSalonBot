@@ -3,10 +3,10 @@ SHELL=/usr/bin/bash
 all: update start
 
 app:
-	@nohup python -m app -O [UserFreelanceSalon] &
+	@nohup python -m app -O [FreelanceSalon] &
 
 debug:
-	@python -m app [UserFreelanceSalon] [DEBUG] &
+	@nohup python -m app [FreelanceSalon] [DEBUG] &
 
 start: app
 
