@@ -2,10 +2,12 @@ import json
 import requests
 import hmac
 import time
+import gmaps
+from ipywidgets.embed import embed_minimal_html
 from typing import Optional
 from contextlib import suppress
 from asyncio import sleep
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import cos, radians
 from aiogram import types, helper, Bot
 from aiogram.types import ReplyKeyboardMarkup as RKM, InlineKeyboardMarkup as IKM
@@ -48,9 +50,8 @@ class ButtonSet(helper.Helper):
     MASTER_2 = helper.Item()
     SEND_LOCATION = helper.Item()
     SAVE_CHANGES = helper.Item()
-    EDIT_PART = helper.Item()
-    EDIT_PART_SALON = helper.Item()
-    EDIT = helper.Item()
+    EDIT_PORTFOLIO = helper.Item()
+    CREATE = helper.Item()
     NEXT = helper.Item()
     RENEW_SUBSCRIPTION = helper.Item()
     INL_CLIENT_ACCEPT_ORDER = helper.Item()
@@ -77,16 +78,14 @@ class ButtonSet(helper.Helper):
             key.add(*(KeyboardButton(x) for x in misc.master_buttons_1))
             key.add(KeyboardButton(misc.back_button))
         elif btn_set == cls.MASTER_2:
-            key.row_width = 2
+            key.row_width = 3
             key.add(*(KeyboardButton(x) for x in misc.master_buttons_2))
         elif btn_set == cls.SAVE_CHANGES:
             key.add(*(KeyboardButton(x) for x in (misc.save_changes, misc.back_button)))
-        elif btn_set == cls.EDIT_PART:
-            key.add(*(KeyboardButton(x) for x in (*misc.edit_buttons[1:], misc.back_button)))
-        elif btn_set == cls.EDIT_PART_SALON:
-            key.add(*(KeyboardButton(x) for x in (*misc.edit_buttons_salon[1:], misc.back_button)))
-        elif btn_set == cls.EDIT:
-            key.add(*(KeyboardButton(x) for x in (misc.edit_buttons[0], misc.back_button)))
+        elif btn_set == cls.EDIT_PORTFOLIO:
+            key.add(*(KeyboardButton(x) for x in (*misc.edit_buttons, misc.back_button)))
+        elif btn_set == cls.CREATE:
+            key.add(*(KeyboardButton(x) for x in (misc.create_button, misc.back_button)))
         elif btn_set == cls.NEXT:
             key.add(*(KeyboardButton(x) for x in (misc.back_button, misc.next_button)))
         elif btn_set == cls.RENEW_SUBSCRIPTION:
@@ -145,14 +144,14 @@ class Orders:
 
 class Master:
     def __init__(self, user_id):
-        selectQuery = "SELECT ID, user_id, balance, categories, categories_count, pay_date, portfolio, salon, " \
+        selectQuery = "SELECT ID, user_id, balance, categories, categories_count, pay_date, portfolio,  " \
                       "ST_X(location), ST_Y(location), active FROM masters WHERE user_id=(%s)"
         with DatabaseConnection() as db:
             conn, cursor = db
             cursor.execute(selectQuery, [user_id])
             result = cursor.fetchone()
         self.id, self.user_id, self.balance, self.categories, self.categories_count, self.pay_date, self.portfolio, \
-            self.salon, self.loc_x, self.loc_y, self.active = result
+            self.loc_x, self.loc_y, self.active = result
         self.categories = json.loads(self.categories) if self.categories else []
 
     @property
@@ -282,13 +281,13 @@ def loc_str(x: float, y: float) -> str:
     return f'POINT({x} {y})'
 
 
-def get_subcategory_name(index: int) -> str:
+def get_subcategory(index: int) -> tuple[int, str]:
     i = 0
     for cat, sub in enumerate(misc.subcategories):
         if len(sub) + i <= index:
             i += len(sub)
         else:
-            return misc.categories[cat] + ': ' + sub[index - i]
+            return cat, misc.categories[cat] + ': ' + sub[index - i]
 
 
 def count_list_categories(subs: list) -> tuple:
@@ -368,22 +367,40 @@ def way_for_pay_request_purchase(user_id, amount):
         return False, response['reason']
 
 
-def update_active_master(master_id, check_payment=False):
-    selectQuery = "SELECT categories, portfolio, salon, location FROM masters WHERE user_id=(%s)"
-    updateQuery = "UPDATE masters SET active=(%s) WHERE user_id=(%s)"
+def subs_pay(chat_id):
+    selectQuery = "SELECT categories_count, balance, pay_date FROM masters WHERE user_id=(%s)"
+    updateQuery = "UPDATE masters SET balance=(%s), pay_date=(%s) WHERE user_id=(%s)"
     with DatabaseConnection() as db:
         conn, cursor = db
-        if check_payment:
-            pass
-        else:
-            cursor.execute(selectQuery, [master_id])
-            result = cursor.fetchone()
-            if all(result):
-                cursor.executemany(updateQuery, [(True, master_id)])
+        cursor.execute(selectQuery, [chat_id])
+        count, balance, pay_date = cursor.fetchone()
+        new_balance = balance - (get_subs_price(count)) if pay_date else 0
+        if not pay_date or pay_date < datetime.now():
+            pay_date = datetime.now()
+        active_until = pay_date + timedelta(days=30)
+        cursor.executemany(updateQuery, [(new_balance, active_until, chat_id)])
         conn.commit()
 
 
+def update_active_master(master_id):
+    selectQuery = "SELECT categories, portfolio, location FROM masters WHERE user_id=(%s) AND active=0"
+    updateQuery = "UPDATE masters SET active=(%s) WHERE user_id=(%s)"
+    pay_free_subs = False
+    with DatabaseConnection() as db:
+        conn, cursor = db
+        cursor.execute(selectQuery, [master_id])
+        result = cursor.fetchone()
+        if result and all(result):
+            cursor.executemany(updateQuery, [(True, master_id)])
+            pay_free_subs = True
+        conn.commit()
+    if pay_free_subs:
+        subs_pay(master_id)
+
+
 def get_subs_price(num):
+    if num == 0:
+        return 0
     if num <= len(misc.tariffs):
         return misc.tariffs[num - 1]
     return misc.tariffs[-1]
@@ -409,7 +426,10 @@ async def bulk_mailing(data, form_id):
                    "ST_Y(location) <= %s AND " \
                    "ST_Y(location) >= %s AND " \
                    "categories LIKE (%s) AND active=1 AND pay_date >= NOW()"
-    r = misc.radius
+    cat_num, cat_name = get_subcategory(data['category'])
+    r = misc.radius_short
+    if cat_num == 9:
+        r = misc.radius_long
     cat_filter = f'%"{data["category"]}"%'
     x, y = data['x'], data['y']
     latitude_dist = 111.3
@@ -435,10 +455,9 @@ async def bulk_mailing(data, form_id):
         if price_flags & 2 ** i:
             if price: price += ', '
             price += '$' * (i + 1)
-    category = get_subcategory_name(data['category'])
     form_text = esc_md(data.get('text') or '-')
     dt = datetime.fromtimestamp(data['timestamp'])
-    text = f"*Новый заказ!*\n*Категория:* {category}\n*Дата*: {dt.day} {misc.month_names[dt.month - 1]}\n" \
+    text = f"*Новый заказ!*\n*Категория:* {cat_name}\n*Дата*: {dt.day} {misc.month_names[dt.month - 1]}\n" \
            f"*Время:* {dt.strftime('%H:%M')}\n*Ценовая категория:* {price}\n*Комментарий:* {form_text}"
     media = MediaGroup(data)
     media.text = None
@@ -450,6 +469,14 @@ async def bulk_mailing(data, form_id):
         await sleep(.05)
 
 
+def make_map(marker_locations, marker_contents, n):
+    gmaps.configure(api_key=config.GMAPS_API_KEY)
+    fig = gmaps.figure()
+    markers = gmaps.marker_layer(marker_locations, info_box_content=marker_contents)
+    fig.add_layer(markers)
+    embed_minimal_html(f'/var/www/html/qsalon.pp.ua/temp/map-{n}.html', views=[fig])
+
+
 __all__ = ('ButtonSet', 'CallbackFuncs', 'delete_message', 'send_message', 'esc_md', 'set_callback', 'get_callback', 'update_active_master', 'Master',
-           'get_location', 'way_for_pay_request_purchase', 'loc_str', 'bulk_mailing', 'count_list_categories', 'Orders', 'get_subcategory_name', 'get_subs_price',
-           'MediaGroup', 'send_media_group')
+           'get_location', 'way_for_pay_request_purchase', 'loc_str', 'bulk_mailing', 'count_list_categories', 'Orders', 'get_subcategory', 'get_subs_price',
+           'MediaGroup', 'send_media_group', 'subs_pay', 'make_map')

@@ -4,3 +4,5 @@ mysql-connector-python~=8.0.26
 envparse~=0.2.0
 python-dotenv~=0.18.0
 aiohttp~=3.7.4.post0
+gmaps~=0.9.0
+ipywidgets~=7.6.5
